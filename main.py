@@ -18,12 +18,27 @@
 #   redistributed within the place, keeping the place's named sum.
 # - Hazard x0.25: the raw disappearance hazard over-kills games; a quarter of
 #   it fits all three cuts better.
+#
+# v3 additions (validated on the same three cuts, NPATHS 2000):
+# - Short-window growth drift: a second playing signal over ~6h
+#   (log playing now / playing ~6h ago, capped to [-1, 2]) with beta 0.2,
+#   on top of the 24h signal. The 24h ratio catches the trend; the 6h ratio
+#   catches the acceleration right before the rank moves. Beta 0.2 wins on
+#   all three cuts; 0.3 and 0.4 are worse.
+# - Relative growth: the 24h log playing ratio is centred by subtracting the
+#   chart-median ratio across candidates. All games' playing rises and falls
+#   together with the time of day, so the raw ratio carries a shared swing;
+#   the centred ratio is the game's growth relative to the chart. This is
+#   what fixes the early-window cut (CUT3), where the raw signal misfires.
+#   (Playing-rank gap and age-drift were tested in the same sweep and
+#   REJECTED: both hurt on MAIN. Occupancy blending was rejected earlier.)
 # Standard library only, no network, fixed seed: every run is byte-identical.
 import json, math, os, random
 
 SEED = 20261113
 NPATHS = 2000
 GROWTH_BETA = 0.4
+GROW6_BETA = 0.2
 TT_PENALTY = 0.15
 TOP_CAP = 0.25
 HAZARD_MULT = 0.25
@@ -170,6 +185,31 @@ def forecast(task, reads):
             cand[uid]['grow'] = 0.0
         else:
             cand[uid]['grow'] = max(-1.0, min(2.0, math.log(max(p_last, 1) / p_base)))
+    # v3: relative growth. Subtract the chart-median 24h log playing change so
+    # the signal is each game's growth RELATIVE to the chart: every game's
+    # playing rises and falls together with the time of day, and that shared
+    # swing is noise. Centring it is what makes the signal hold up on the
+    # early-window cut too.
+    _grows = sorted(cand[uid].get('grow', 0.0) for uid in cand)
+    _med = _grows[len(_grows) // 2] if _grows else 0.0
+    for uid in cand:
+        cand[uid]['grow'] = max(-1.0, min(2.0, cand[uid].get('grow', 0.0) - _med))
+    # v3: short-window growth. Same construction over ~6h: log(playing now /
+    # playing ~6h ago), capped to [-1, 2]. The 24h ratio carries the trend;
+    # the 6h ratio carries the acceleration right before the rank moves.
+    for uid, s in series.items():
+        if uid not in cand or len(s) < 2:
+            continue
+        t_last, r_last, p_last = s[-1]
+        prev6 = [x for x in s[:-1] if (t_last - x[0]) >= 4 * 3600]
+        if not prev6 or p_last <= 0:
+            cand[uid]['grow6'] = 0.0
+            continue
+        p_base6 = prev6[-1][2]
+        if p_base6 <= 0:
+            cand[uid]['grow6'] = 0.0
+        else:
+            cand[uid]['grow6'] = max(-1.0, min(2.0, math.log(max(p_last, 1) / p_base6)))
     # games on Top Trending at the last read drift worse (already big, growth slows)
     tt_ids = {row['universe_id'] for row in (last.get('top_trending') or [])}
     # age proxy: seconds since first seen (or created when known)
@@ -211,6 +251,7 @@ def forecast(task, reads):
     ids = sorted(cand)
     n = len(ids)
     grow_arr = [cand[uid].get('grow', 0.0) for uid in ids]
+    grow6_arr = [cand[uid].get('grow6', 0.0) for uid in ids]
     counts = [[0.0] * (places + 1) for _ in range(n)]  # counts[gi][place]
     rank_sum = [0.0] * n
     rank_n = [0] * n
@@ -244,6 +285,7 @@ def forecast(task, reads):
                 b = band(r)
                 d = drift[b] + 0.5 * mom_w * max(-3.0, min(3.0, vel[gi]))  # tuned momentum weight
                 d -= GROWTH_BETA * grow_arr[gi]  # playing surge pulls rank down (better)
+                d -= GROW6_BETA * grow6_arr[gi]  # v3: short-window surge, same direction
                 if ids[gi] in tt_ids:
                     d += TT_PENALTY  # on Top Trending: growth already spent
                 # age-aware death: hazard grows as the game ages toward 28 days
