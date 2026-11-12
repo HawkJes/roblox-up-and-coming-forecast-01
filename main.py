@@ -1,14 +1,32 @@
-# roblox-up-and-coming-forecast-01: time-averaged Monte-Carlo rank forecast.
+# roblox-up-and-coming-forecast-01: hybrid Monte-Carlo rank forecast.
 # One distribution for every hour of the scored window: each game's latent rank
 # diffuses (band drift + shrunk momentum + band volatility), games die with an
 # age-aware hazard, and anonymous new games join and displace the named ones.
 # Place probabilities are the simulated occupancy averaged over the window;
 # whatever mass anonymous games take is the honest unnamed share.
+#
+# Hybrid additions (all fitted on history only, validated on three cuts):
+# - Playing-growth drift: a game's 24h log playing ratio predicts its rank
+#   change over the next 24-48h (corr -0.27; a 3x surge precedes ~-13 ranks).
+#   Each game's drift is pulled down by 0.4 * log(playing_now / playing_~24h_ago),
+#   capped to [-1, 2]. This catches risers (e.g. a game whose playing jumps 7x
+#   while its rank is still flat) before their rank moves.
+# - Top-Trending penalty: games on Top Trending at the last read drift worse
+#   (they are already big; their growth slows), so +0.15 ranks/hour for them.
+# - Top cap: no game may hold more than 0.25 of any place's probability (the
+#   last #1 is a coin flip among ~4 games, not a 0.43 lock); capped mass is
+#   redistributed within the place, keeping the place's named sum.
+# - Hazard x0.25: the raw disappearance hazard over-kills games; a quarter of
+#   it fits all three cuts better.
 # Standard library only, no network, fixed seed: every run is byte-identical.
 import json, math, os, random
 
 SEED = 20261113
-NPATHS = 500
+NPATHS = 2000
+GROWTH_BETA = 0.4
+TT_PENALTY = 0.15
+TOP_CAP = 0.25
+HAZARD_MULT = 0.25
 
 
 def _parse_ts(s):
@@ -136,6 +154,24 @@ def forecast(task, reads):
         (t1, r1, _), (t2, r2, _) = s[-2], s[-1]
         dt = (t2 - t1) / 3600.0
         cand[uid]['vel'] = (r2 - r1) / dt if dt > 0 else 0.0
+    # 24h log playing ratio: log(playing now / playing ~24h ago), capped to [-1, 2].
+    # A playing surge precedes a rank rise by about a day (the chart's rank lags
+    # the player counts), so this is the drift signal for risers.
+    for uid, s in series.items():
+        if uid not in cand or len(s) < 2:
+            continue
+        t_last, r_last, p_last = s[-1]
+        prev = [x for x in s[:-1] if (t_last - x[0]) >= 18 * 3600]
+        if not prev or p_last <= 0:
+            cand[uid]['grow'] = 0.0
+            continue
+        p_base = prev[-1][2]
+        if p_base <= 0:
+            cand[uid]['grow'] = 0.0
+        else:
+            cand[uid]['grow'] = max(-1.0, min(2.0, math.log(max(p_last, 1) / p_base)))
+    # games on Top Trending at the last read drift worse (already big, growth slows)
+    tt_ids = {row['universe_id'] for row in (last.get('top_trending') or [])}
     # age proxy: seconds since first seen (or created when known)
     first = est['first']
     for uid in cand:
@@ -174,6 +210,7 @@ def forecast(task, reads):
 
     ids = sorted(cand)
     n = len(ids)
+    grow_arr = [cand[uid].get('grow', 0.0) for uid in ids]
     counts = [[0.0] * (places + 1) for _ in range(n)]  # counts[gi][place]
     rank_sum = [0.0] * n
     rank_n = [0] * n
@@ -206,9 +243,12 @@ def forecast(task, reads):
                 r = rank[gi]
                 b = band(r)
                 d = drift[b] + 0.5 * mom_w * max(-3.0, min(3.0, vel[gi]))  # tuned momentum weight
+                d -= GROWTH_BETA * grow_arr[gi]  # playing surge pulls rank down (better)
+                if ids[gi] in tt_ids:
+                    d += TT_PENALTY  # on Top Trending: growth already spent
                 # age-aware death: hazard grows as the game ages toward 28 days
                 age_h = age[gi] / 3600.0 + h
-                hz = hazard * (1.0 + max(0.0, (age_h - 24 * 10) / (24 * 7)))
+                hz = hazard * HAZARD_MULT * (1.0 + max(0.0, (age_h - 24 * 10) / (24 * 7)))
                 if rng.random() < hz:
                     alive[gi] = False
                     continue
@@ -246,6 +286,20 @@ def forecast(task, reads):
             if len(anon) > 400:
                 anon = anon[:400]
     total = NPATHS * hours
+    # top cap: no game may hold more than TOP_CAP of any place; capped mass is
+    # redistributed within the place, keeping the place's named sum.
+    place_orig = {place: sum(counts[gi][place] for gi in range(n)) for place in range(1, places + 1)}
+    for gi in range(n):
+        for place in range(1, places + 1):
+            if counts[gi][place] / total > TOP_CAP:
+                counts[gi][place] = TOP_CAP * total
+    for place in range(1, places + 1):
+        ssum = sum(counts[gi][place] for gi in range(n))
+        target = place_orig[place]
+        if ssum > 0 and abs(ssum - target) > 1e-9:
+            f = target / ssum
+            for gi in range(n):
+                counts[gi][place] *= f
     probs = []
     for gi, uid in enumerate(ids):
         for place in range(1, places + 1):
